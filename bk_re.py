@@ -1,5 +1,5 @@
 # Dev by: Sin Kabir
-# GitHub: https://github.com/c-Nojoom/
+# GitHub: https://github.com/1NoJoom/
 
 import os
 import subprocess
