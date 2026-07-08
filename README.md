@@ -3,7 +3,7 @@
 # 🚀 اسکریپت PasarGuard-bk.re
 
 ![Version](https://img.shields.io/badge/Version-v1.0-blue.svg)
-![Bash](https://img.shields.io/badge/Language-Bash-green.svg)
+![Bash](https://img.shields.io/badge/Language-python-green.svg)
 ## 🛠 راهنمای نصب
 
 برای نصب اسکریپت، کافیست با دسترسی روت (Root) وارد ترمینال سرور خود شده و دستور زیر را اجرا کنید:
