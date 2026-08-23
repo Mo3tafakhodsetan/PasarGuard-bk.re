@@ -12,6 +12,7 @@ import urllib.error
 import uuid
 import threading
 import itertools
+import shlex
 
 class Colors:
     HEADER = '\033[95m'
@@ -35,7 +36,6 @@ class Spinner:
             sys.stdout.write(f"\r{Colors.YELLOW}⏳ {next(self.spinner_cycle)} {self.message}{Colors.RESET}")
             sys.stdout.flush()
             time.sleep(0.1)
-        # Clear the line when stopped
         sys.stdout.write('\r' + ' ' * (len(self.message) + 15) + '\r')
         sys.stdout.flush()
 
@@ -67,7 +67,6 @@ def print_header(title):
 def pause_and_return():
     input(f"\n{Colors.YELLOW}Press [ENTER] to return to the main menu...{Colors.RESET}")
 
-# Auto-install paramiko
 try:
     import paramiko
 except ImportError:
@@ -77,7 +76,6 @@ except ImportError:
             subprocess.check_call(["apt-get", "update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.check_call(["apt-get", "install", "-y", "python3-paramiko", "python3-pip", "unzip"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
-            # Fallback to pip silently
             subprocess.check_call([sys.executable, "-m", "pip", "install", "paramiko", "--quiet"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     import paramiko
     print(f"{Colors.GREEN}✅ Libraries installed successfully!{Colors.RESET}\n")
@@ -88,7 +86,6 @@ def run_command(command, output_file=None, cwd=None, quiet=True):
             with open(output_file, "w") as f:
                 subprocess.run(command, shell=True, check=True, stdout=f, stderr=subprocess.PIPE, cwd=cwd)
         else:
-            # Hide output
             stdout_target = subprocess.DEVNULL if quiet else None
             subprocess.run(command, shell=True, check=True, stdout=stdout_target, stderr=subprocess.PIPE, cwd=cwd)
         return True
@@ -98,7 +95,253 @@ def run_command(command, output_file=None, cwd=None, quiet=True):
             print_error(f"Details: {e.stderr.decode('utf-8').strip()}")
         return False
 
-# ─── Docker stack paths & timing ───
+def _read_env_var(env_path, var_name):
+    if not os.path.isfile(env_path):
+        return None
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if key == var_name:
+                    value = value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                        value = value[1:-1]
+                    return value
+    except Exception:
+        pass
+    return None
+
+def _update_env_var_local(env_path, var_name, new_value):
+    try:
+        lines = []
+        found = False
+        if os.path.isfile(env_path):
+            with open(env_path, "r") as f:
+                lines = f.readlines()
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+                if key == var_name:
+                    lines[i] = f'{var_name}="{new_value}"\n'
+                    found = True
+                    break
+        if not found:
+            lines.append(f'{var_name}="{new_value}"\n')
+        with open(env_path, "w") as f:
+            f.writelines(lines)
+        return True
+    except Exception:
+        return False
+
+def _update_env_var_ssh(ssh, env_path, var_name, new_value):
+    escaped = new_value.replace('"', '\\"')
+    cmd = (
+        f"grep -q '^{var_name}=' {env_path} 2>/dev/null && "
+        f"sed -i 's|^{var_name}=.*|{var_name}=\"{escaped}\"|' {env_path} || "
+        f"echo '{var_name}=\"{escaped}\"' >> {env_path}"
+    )
+    exit_code, _, _ = ssh_shell(ssh, cmd)
+    return exit_code == 0
+
+def _test_mysql_password_local(compose_dir, password):
+    if password is None:
+        return False
+    cmd = "docker compose exec -T mysql sh -c " + shlex.quote(f'mysql -uroot -p{password} -e "SELECT 1;"')
+    ok, _, _ = local_shell(cmd, cwd=compose_dir)
+    return ok
+
+def _test_mysql_password_ssh(ssh, compose_dir, password):
+    if password is None:
+        return False
+    cmd = f"cd {compose_dir} && docker compose exec -T mysql sh -c " + shlex.quote(f'mysql -uroot -p{password} -e "SELECT 1;"')
+    exit_code, _, _ = ssh_shell(ssh, cmd)
+    return exit_code == 0
+
+def capture_current_mysql_password_local(compose_dir):
+    env_path = os.path.join(compose_dir, ".env")
+    current_password = _read_env_var(env_path, "MYSQL_ROOT_PASSWORD")
+    if not current_password:
+        return None
+    running = _running_compose_ids_local(compose_dir)
+    if running and _test_mysql_password_local(compose_dir, current_password):
+        print_info("Verified the current install's MySQL root password before wiping anything — keeping it as a fallback.")
+    return current_password
+
+def capture_current_mysql_password_ssh(ssh, compose_dir):
+    env_path = f"{compose_dir}/.env"
+    exit_code, current_password, _ = ssh_shell(
+        ssh,
+        f"grep '^MYSQL_ROOT_PASSWORD=' {env_path} 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\"'"
+    )
+    current_password = current_password.strip() if exit_code == 0 else None
+    if not current_password:
+        return None
+    running = _running_compose_ids_ssh(ssh, compose_dir)
+    if running and _test_mysql_password_ssh(ssh, compose_dir, current_password):
+        print_info("Verified the current install's MySQL root password before wiping anything — keeping it as a fallback.")
+    return current_password
+
+def resolve_mysql_root_password_local(compose_dir, extra_candidates=None):
+    env_path = os.path.join(compose_dir, ".env")
+    candidates = []
+    env_password = _read_env_var(env_path, "MYSQL_ROOT_PASSWORD")
+    if env_password:
+        candidates.append(env_password)
+    for c in (extra_candidates or []):
+        if c and c not in candidates:
+            candidates.append(c)
+
+    for pw in candidates:
+        if _test_mysql_password_local(compose_dir, pw):
+            if pw != env_password:
+                if _update_env_var_local(env_path, "MYSQL_ROOT_PASSWORD", pw):
+                    print_success(f"Found a working MySQL root password and synced it into .env.")
+                else:
+                    print_warning("Found a working password but couldn't auto-update .env — update it manually.")
+            return pw
+
+    print_warning("None of the known passwords (.env, pre-restore password) matched the restored database.")
+    print_warning("(This happens because MYSQL_ROOT_PASSWORD only applies the first time MySQL initializes — not on every start.)")
+    for attempt in range(3):
+        manual_pw = input(f"{Colors.CYAN}🔑 Enter the correct MySQL root password: {Colors.RESET}").strip()
+        if _test_mysql_password_local(compose_dir, manual_pw):
+            print_success("Password accepted.")
+            if _update_env_var_local(env_path, "MYSQL_ROOT_PASSWORD", manual_pw):
+                print_success(".env updated so future runs use this password automatically.")
+            else:
+                print_warning("Could not update .env automatically — update it manually.")
+            return manual_pw
+        print_error("That password didn't work either.")
+    return None
+
+def resolve_mysql_root_password_ssh(ssh, compose_dir, extra_candidates=None):
+    env_path = f"{compose_dir}/.env"
+    exit_code, env_password, _ = ssh_shell(
+        ssh,
+        f"grep '^MYSQL_ROOT_PASSWORD=' {env_path} 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\"'"
+    )
+    env_password = env_password.strip() if exit_code == 0 else None
+    candidates = []
+    if env_password:
+        candidates.append(env_password)
+    for c in (extra_candidates or []):
+        if c and c not in candidates:
+            candidates.append(c)
+
+    for pw in candidates:
+        if _test_mysql_password_ssh(ssh, compose_dir, pw):
+            if pw != env_password:
+                if _update_env_var_ssh(ssh, env_path, "MYSQL_ROOT_PASSWORD", pw):
+                    print_success("Found a working MySQL root password and synced it into .env.")
+                else:
+                    print_warning("Found a working password but couldn't auto-update .env — update it manually.")
+            return pw
+
+    print_warning("None of the known passwords (.env, pre-restore password) matched the restored database.")
+    print_warning("(This happens because MYSQL_ROOT_PASSWORD only applies the first time MySQL initializes — not on every start.)")
+    for attempt in range(3):
+        manual_pw = input(f"{Colors.CYAN}🔑 Enter the correct MySQL root password: {Colors.RESET}").strip()
+        if _test_mysql_password_ssh(ssh, compose_dir, manual_pw):
+            print_success("Password accepted.")
+            if _update_env_var_ssh(ssh, env_path, "MYSQL_ROOT_PASSWORD", manual_pw):
+                print_success(".env updated so future runs use this password automatically.")
+            else:
+                print_warning("Could not update .env automatically — update it manually.")
+            return manual_pw
+        print_error("That password didn't work either.")
+    return None
+
+def _escape_mysql_literal(value):
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+def sync_app_db_credentials_local(compose_dir, mysql_root_password):
+    env_path = os.path.join(compose_dir, ".env")
+    db_user = _read_env_var(env_path, "DB_USER") or "pasarguard"
+    db_password = _read_env_var(env_path, "DB_PASSWORD")
+    db_name = _read_env_var(env_path, "DB_NAME") or "pasarguard"
+
+    if not db_password:
+        print_warning("DB_PASSWORD not found in .env — skipping application DB user sync.")
+        return False
+
+    print_info(f"Syncing application DB user '{db_user}' password with .env...")
+    sql = (
+        f"CREATE USER IF NOT EXISTS '{db_user}'@'%' IDENTIFIED BY '{safe_pw}'; "
+        f"ALTER USER '{db_user}'@'%' IDENTIFIED BY '{safe_pw}'; "
+        f"GRANT ALL PRIVILEGES ON {db_name}.* TO '{db_user}'@'%'; "
+        f"FLUSH PRIVILEGES;"
+    )
+    mysql_cmd = shlex.join(["mysql", "-uroot", f"-p{mysql_root_password}", "-e", sql])
+    cmd = "docker compose exec -T mysql sh -c " + shlex.quote(mysql_cmd)
+    ok, _, err = local_shell(cmd, cwd=compose_dir)
+    if not ok:
+        print_error(f"Failed to sync application DB user '{db_user}'.")
+        if err:
+            print_error(err)
+        return False
+
+    verify_mysql_cmd = shlex.join(["mysql", f"-u{db_user}", f"-p{db_password}", "-e", f"USE {db_name}; SELECT 1;"])
+    verify_cmd = "docker compose exec -T mysql sh -c " + shlex.quote(verify_mysql_cmd)
+    if not local_shell(verify_cmd, cwd=compose_dir)[0]:
+        print_error(f"Synced '{db_user}' but the new credentials still don't authenticate — aborting.")
+        return False
+
+    print_success(f"Application DB user '{db_user}' is synced with .env and verified working.")
+    return True
+
+def sync_app_db_credentials_ssh(ssh, compose_dir, mysql_root_password):
+    env_path = f"{compose_dir}/.env"
+    exit_code, db_user, _ = ssh_shell(
+        ssh, f"grep '^DB_USER=' {env_path} 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\"'"
+    )
+    db_user = db_user.strip() if exit_code == 0 and db_user.strip() else "pasarguard"
+
+    exit_code, db_password, _ = ssh_shell(
+        ssh, f"grep '^DB_PASSWORD=' {env_path} 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\"'"
+    )
+    db_password = db_password.strip() if exit_code == 0 else None
+
+    exit_code, db_name, _ = ssh_shell(
+        ssh, f"grep '^DB_NAME=' {env_path} 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\"'"
+    )
+    db_name = db_name.strip() if exit_code == 0 and db_name.strip() else "pasarguard"
+
+    if not db_password:
+        print_warning("DB_PASSWORD not found in .env — skipping application DB user sync.")
+        return False
+
+    print_info(f"Syncing application DB user '{db_user}' password with .env...")
+    safe_pw = _escape_mysql_literal(db_password)
+    sql = (
+        f"CREATE USER IF NOT EXISTS '{db_user}'@'%' IDENTIFIED BY '{safe_pw}'; "
+        f"ALTER USER '{db_user}'@'%' IDENTIFIED BY '{safe_pw}'; "
+        f"GRANT ALL PRIVILEGES ON {db_name}.* TO '{db_user}'@'%'; "
+        f"FLUSH PRIVILEGES;"
+    )
+    mysql_cmd = shlex.join(["mysql", "-uroot", f"-p{mysql_root_password}", "-e", sql])
+    cmd = f"cd {compose_dir} && docker compose exec -T mysql sh -c " + shlex.quote(mysql_cmd)
+    exit_code, _, err = ssh_shell(ssh, cmd)
+    if exit_code != 0:
+        print_error(f"Failed to sync application DB user '{db_user}'.")
+        if err:
+            print_error(err)
+        return False
+
+    verify_mysql_cmd = shlex.join(["mysql", f"-u{db_user}", f"-p{db_password}", "-e", f"USE {db_name}; SELECT 1;"])
+    verify_cmd = f"cd {compose_dir} && docker compose exec -T mysql sh -c " + shlex.quote(verify_mysql_cmd)
+    verify_code, _, _ = ssh_shell(ssh, verify_cmd)
+    if verify_code != 0:
+        print_error(f"Synced '{db_user}' but the new credentials still don't authenticate — aborting.")
+        return False
+
+    print_success(f"Application DB user '{db_user}' is synced with .env and verified working.")
+    return True
+
 PASARGUARD_DIR = "/opt/pasarguard"
 PG_NODE_DIR = "/opt/pg-node"
 PASARGUARD_DATA_DIR = "/var/lib/pasarguard"
@@ -112,7 +355,6 @@ COMPOSE_UP_INTERVAL = 3
 COMPOSE_STOP_RETRIES = 3
 
 def local_shell(command, cwd=None):
-    """Run a shell command locally; return (ok, stdout, stderr)."""
     try:
         result = subprocess.run(
             command, shell=True, cwd=cwd, capture_output=True, text=True
@@ -122,7 +364,6 @@ def local_shell(command, cwd=None):
         return False, "", str(e)
 
 def ssh_shell(ssh, command):
-    """Run a command over SSH; return (exit_code, stdout, stderr)."""
     stdin, stdout, stderr = ssh.exec_command(command)
     exit_status = stdout.channel.recv_exit_status()
     return exit_status, stdout.read().decode().strip(), stderr.read().decode().strip()
@@ -154,7 +395,6 @@ def _expected_running_count_ssh(ssh, compose_dir, services):
     return len([line for line in out.splitlines() if line.strip()])
 
 def stop_compose_stack_local(compose_dir, label):
-    """Stop a docker compose stack and verify every container is down."""
     if not os.path.isdir(compose_dir):
         print_warning(f"{label}: {compose_dir} not found — nothing to stop.")
         return True
@@ -186,7 +426,6 @@ def stop_compose_stack_local(compose_dir, label):
     return False
 
 def stop_compose_stack_ssh(ssh, compose_dir, label):
-    """Stop a docker compose stack over SSH and verify every container is down."""
     exit_code, _, _ = ssh_shell(ssh, f"test -d {compose_dir} && test -f {compose_dir}/docker-compose.yml")
     if exit_code != 0:
         print_warning(f"{label}: {compose_dir} not found or missing docker-compose.yml — skipping stop.")
@@ -213,7 +452,6 @@ def stop_compose_stack_ssh(ssh, compose_dir, label):
     return False
 
 def clean_restore_directories_local():
-    """Remove and recreate restore target directories after containers are stopped."""
     targets = [
         (PASARGUARD_DIR, "Pasarguard config (/opt/pasarguard)"),
         (PG_NODE_DIR, "PG-Node config (/opt/pg-node)"),
@@ -232,7 +470,6 @@ def clean_restore_directories_local():
     return True
 
 def clean_restore_directories_ssh(ssh):
-    """Remove and recreate restore target directories on remote server."""
     targets = [
         (PASARGUARD_DIR, "Pasarguard config (/opt/pasarguard)"),
         (PG_NODE_DIR, "PG-Node config (/opt/pg-node)"),
@@ -255,7 +492,6 @@ def clean_restore_directories_ssh(ssh):
     return True
 
 def wait_for_postgres_ready_local():
-    """Wait until timescaledb accepts connections."""
     print_info("Waiting for timescaledb to become ready...")
     deadline = time.time() + POSTGRES_READY_MAX_WAIT
     while time.time() < deadline:
@@ -271,7 +507,6 @@ def wait_for_postgres_ready_local():
     return False
 
 def wait_for_postgres_ready_ssh(ssh):
-    """Wait until remote timescaledb accepts connections."""
     print_info("Waiting for timescaledb to become ready...")
     deadline = time.time() + POSTGRES_READY_MAX_WAIT
     while time.time() < deadline:
@@ -286,8 +521,37 @@ def wait_for_postgres_ready_ssh(ssh):
     print_error("Database did not become ready in time.")
     return False
 
-def start_compose_stack_local(compose_dir, label, services=None, wait_postgres=False):
-    """Start docker compose stack locally and verify containers are running."""
+def wait_for_mysql_ready_local():
+    print_info("Waiting for mysql to become ready...")
+    deadline = time.time() + POSTGRES_READY_MAX_WAIT
+    while time.time() < deadline:
+        ok, _, _ = local_shell(
+            "docker compose exec -T mysql sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'",
+            cwd=PASARGUARD_DIR,
+        )
+        if ok:
+            print_success("MySQL is ready for restore operations.")
+            return True
+        time.sleep(POSTGRES_READY_INTERVAL)
+    print_error("MySQL did not become ready in time.")
+    return False
+
+def wait_for_mysql_ready_ssh(ssh):
+    print_info("Waiting for mysql to become ready...")
+    deadline = time.time() + POSTGRES_READY_MAX_WAIT
+    while time.time() < deadline:
+        exit_code, _, _ = ssh_shell(
+            ssh,
+            f"cd {PASARGUARD_DIR} && docker compose exec -T mysql sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'",
+        )
+        if exit_code == 0:
+            print_success("MySQL is ready for restore operations.")
+            return True
+        time.sleep(POSTGRES_READY_INTERVAL)
+    print_error("MySQL did not become ready in time.")
+    return False
+
+def start_compose_stack_local(compose_dir, label, services=None, wait_postgres=False, wait_mysql=False):
     if not os.path.isdir(compose_dir) or not os.path.isfile(os.path.join(compose_dir, "docker-compose.yml")):
         print_error(f"{label}: compose project not found at {compose_dir}")
         return False
@@ -299,6 +563,8 @@ def start_compose_stack_local(compose_dir, label, services=None, wait_postgres=F
         return False
 
     if wait_postgres and not wait_for_postgres_ready_local():
+        return False
+    if wait_mysql and not wait_for_mysql_ready_local():
         return False
 
     expected = _expected_running_count_local(compose_dir, services)
@@ -321,8 +587,7 @@ def start_compose_stack_local(compose_dir, label, services=None, wait_postgres=F
         print_error(status)
     return False
 
-def start_compose_stack_ssh(ssh, compose_dir, label, services=None, wait_postgres=False):
-    """Start docker compose stack over SSH and verify containers are running."""
+def start_compose_stack_ssh(ssh, compose_dir, label, services=None, wait_postgres=False, wait_mysql=False):
     exit_code, _, _ = ssh_shell(ssh, f"test -d {compose_dir} && test -f {compose_dir}/docker-compose.yml")
     if exit_code != 0:
         print_error(f"{label}: compose project not found at {compose_dir}")
@@ -338,6 +603,8 @@ def start_compose_stack_ssh(ssh, compose_dir, label, services=None, wait_postgre
         return False
 
     if wait_postgres and not wait_for_postgres_ready_ssh(ssh):
+        return False
+    if wait_mysql and not wait_for_mysql_ready_ssh(ssh):
         return False
 
     expected = _expected_running_count_ssh(ssh, compose_dir, services)
@@ -412,7 +679,7 @@ def send_telegram_file(token, chat_id, file_path, caption=""):
     except Exception as e:
         return False, f"Connection error: {e}"
 
-def create_backup():
+def create_backup(db_type="timescaledb"):
     print_info("Starting Backup Generation...")
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     backup_name = f"backup_{timestamp}"
@@ -422,15 +689,12 @@ def create_backup():
     final_zip_base = os.path.join(current_dir, backup_name)
     expected_zip_file = f"{final_zip_base}.zip"
 
-    # Pasarguard paths
     opt_dir = "/opt/pasarguard"
     data_dir = "/var/lib/pasarguard"
 
-    # PG-Node paths
     pg_node_opt_dir_src = "/opt/pg-node"
     pg_node_data_dir_src = "/var/lib/pg-node"
 
-    # Temp structure
     pg_dump_dir = os.path.join(tmp_dir, "pg_dump")
     pasarguard_data_dir = os.path.join(tmp_dir, "pasarguard_data")
     pg_node_opt_dir_dest = os.path.join(tmp_dir, "pg_node_opt")
@@ -446,17 +710,22 @@ def create_backup():
         if os.path.exists(os.path.join(opt_dir, ".env")):
             shutil.copy(os.path.join(opt_dir, ".env"), tmp_dir)
 
-        print_info("Exporting PostgreSQL globals... (This may take a moment)")
-        cmd_globals = "docker compose exec -T timescaledb pg_dumpall -U pasarguard --globals-only"
-        run_command(cmd_globals, output_file=os.path.join(pg_dump_dir, "globals.sql"), cwd=opt_dir)
+        if db_type == "timescaledb":
+            print_info("Exporting PostgreSQL globals... (This may take a moment)")
+            cmd_globals = "docker compose exec -T timescaledb pg_dumpall -U pasarguard --globals-only"
+            run_command(cmd_globals, output_file=os.path.join(pg_dump_dir, "globals.sql"), cwd=opt_dir)
 
-        print_info("Exporting Pasarguard database... (Please wait, this might take a while for large databases)")
-        cmd_db = "docker compose exec -T timescaledb pg_dump -U pasarguard -d pasarguard"
-        run_command(cmd_db, output_file=os.path.join(pg_dump_dir, "db-001.sql"), cwd=opt_dir)
+            print_info("Exporting Pasarguard database... (Please wait, this might take a while for large databases)")
+            cmd_db = "docker compose exec -T timescaledb pg_dump -U pasarguard -d pasarguard"
+            run_command(cmd_db, output_file=os.path.join(pg_dump_dir, "db-001.sql"), cwd=opt_dir)
 
-        print_info("Creating manifest file...")
-        with open(os.path.join(pg_dump_dir, "manifest.tsv"), "w") as f:
-            f.write("pasarguard\tpasarguard\t1\tdb-001.sql\t2.28.1\n")
+            print_info("Creating manifest file...")
+            with open(os.path.join(pg_dump_dir, "manifest.tsv"), "w") as f:
+                f.write("pasarguard\tpasarguard\t1\tdb-001.sql\t2.28.1\n")
+        else:
+            print_info("Exporting MySQL database... (Please wait, this might take a while for large databases)")
+            cmd_db = 'docker compose exec -T mysql sh -c \'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" pasarguard\''
+            run_command(cmd_db, output_file=os.path.join(pg_dump_dir, "db_backup.sql"), cwd=opt_dir)
 
         print_info("Copying Pasarguard data directory...")
         if os.path.exists(data_dir):
@@ -464,7 +733,6 @@ def create_backup():
         else:
             print_warning(f"Data directory {data_dir} not found. Skipping...")
 
-        # -- PG-Node Backup --
         print_info("Copying PG-Node configuration directory (/opt/pg-node)...")
         if os.path.exists(pg_node_opt_dir_src):
             shutil.copytree(pg_node_opt_dir_src, pg_node_opt_dir_dest)
@@ -506,16 +774,14 @@ def execute_ssh_command(ssh, command, description, required=True):
             print_error(f"Details: {out}")
     return exit_status == 0 if required else True
 
-def workflow_auto_backup_restore():
+def workflow_auto_backup_restore(db_type="timescaledb"):
     print_header("Auto Backup & Transfer to New Server")
     
-    # 1. Create Backup
-    zip_file_path = create_backup()
+    zip_file_path = create_backup(db_type)
     if not zip_file_path or not os.path.exists(zip_file_path):
         print_error("Aborting process due to backup failure.")
         return
 
-    # 2. Telegram Options
     print("")
     send_to_tg = input(f"{Colors.CYAN}🤖 Do you want to send this backup to a Telegram Bot first? (y/n): {Colors.RESET}").strip().lower()
     if send_to_tg == 'y':
@@ -530,9 +796,10 @@ def workflow_auto_backup_restore():
         else:
             print_error(f"Telegram upload failed: {details}")
 
-    # 3. New Server Details
     print(f"\n{Colors.BOLD}--- New Server Information ---{Colors.RESET}")
     new_server_ip = input(f"{Colors.CYAN}🖥️  Enter New Server IP: {Colors.RESET}").strip()
+    ssh_port_input = input(f"{Colors.CYAN}🔌 Enter SSH Port (Default 22): {Colors.RESET}").strip()
+    ssh_port = int(ssh_port_input) if ssh_port_input.isdigit() else 22
     
     is_root = input(f"{Colors.CYAN}⚠️  User MUST be root. Do you confirm? (y/n): {Colors.RESET}").strip().lower()
     if is_root != 'y':
@@ -541,19 +808,21 @@ def workflow_auto_backup_restore():
         
     new_server_pass = input(f"{Colors.CYAN}🔑 Enter Root Password: {Colors.RESET}").strip()
 
-    # 4. SSH Process
-    print_info(f"Connecting to {new_server_ip}...")
+    print_info(f"Connecting to {new_server_ip}:{ssh_port}...")
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     
     try:
-        ssh.connect(hostname=new_server_ip, username='root', password=new_server_pass, timeout=10)
+        ssh.connect(hostname=new_server_ip, port=ssh_port, username='root', password=new_server_pass, timeout=30)
         print_success("Connected to the new server!")
         print("")
         
         execute_ssh_command(ssh, "apt-get update >/dev/null 2>&1 && apt-get install -y unzip >/dev/null 2>&1", "Installing 'unzip' package silently")
 
-        # Stop PG-Node first, then Pasarguard (separate compose projects in two folders)
+        pre_restore_mysql_password = None
+        if db_type == "mysql":
+            pre_restore_mysql_password = capture_current_mysql_password_ssh(ssh, PASARGUARD_DIR)
+
         if not stop_compose_stack_ssh(ssh, PG_NODE_DIR, "PG-Node"):
             print_error("Aborting: PG-Node containers could not be stopped cleanly.")
             return
@@ -565,7 +834,6 @@ def workflow_auto_backup_restore():
             print_error("Aborting: directory cleanup failed.")
             return
 
-        # Upload zip
         print(f"{Colors.CYAN}🌐 [SSH]{Colors.RESET} Uploading backup file (This depends on your internet speed)...")
         sftp = ssh.open_sftp()
         zip_filename = os.path.basename(zip_file_path)
@@ -574,10 +842,8 @@ def workflow_auto_backup_restore():
         sftp.close()
         print_success("Upload completed.")
 
-        # Extract files
         execute_ssh_command(ssh, f"cd /opt/pasarguard && unzip -q -o {zip_filename}", "Extracting files (This may take a moment)")
         
-        # Distribute Pasarguard Data and PG-Node
         if not execute_ssh_command(ssh, "cp -a /opt/pasarguard/pasarguard_data/. /var/lib/pasarguard/ 2>/dev/null || true && rm -rf /opt/pasarguard/pasarguard_data", "Restoring Pasarguard data"):
             print_error("Aborting: failed to restore Pasarguard data.")
             return
@@ -588,26 +854,53 @@ def workflow_auto_backup_restore():
             print_error("Aborting: failed to restore PG-Node data.")
             return
 
-        # Start database only, wait until PostgreSQL is fully ready, then restore
-        if not start_compose_stack_ssh(ssh, PASARGUARD_DIR, "Pasarguard DB", services=["timescaledb"], wait_postgres=True):
-            print_error("Aborting: timescaledb did not start correctly.")
-            return
+        if db_type == "timescaledb":
+            if not start_compose_stack_ssh(ssh, PASARGUARD_DIR, "Pasarguard DB", services=["timescaledb"], wait_postgres=True):
+                print_error("Aborting: timescaledb did not start correctly.")
+                return
 
-        if not execute_ssh_command(ssh, 'cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres -c "DROP DATABASE IF EXISTS pasarguard WITH (FORCE);"', "Dropping old database to prevent conflicts"):
-            print_error("Aborting: failed to drop old database.")
-            return
-        if not execute_ssh_command(ssh, 'cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres -c "CREATE DATABASE pasarguard;"', "Creating a fresh, clean database"):
-            print_error("Aborting: failed to create database.")
-            return
+            if not execute_ssh_command(ssh, 'cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres -c "DROP DATABASE IF EXISTS pasarguard WITH (FORCE);"', "Dropping old database to prevent conflicts"):
+                print_error("Aborting: failed to drop old database.")
+                return
+            if not execute_ssh_command(ssh, 'cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres -c "CREATE DATABASE pasarguard;"', "Creating a fresh, clean database"):
+                print_error("Aborting: failed to create database.")
+                return
 
-        if not execute_ssh_command(ssh, "cd /opt/pasarguard && cat pg_dump/globals.sql | docker compose exec -T timescaledb psql -U pasarguard", "Restoring globals.sql"):
-            print_error("Aborting: failed to restore globals.sql.")
-            return
-        if not execute_ssh_command(ssh, "cd /opt/pasarguard && cat pg_dump/db-001.sql | docker compose exec -T timescaledb psql -U pasarguard -d pasarguard", "Restoring db-001.sql (Please wait, this might take a while for large databases)"):
-            print_error("Aborting: failed to restore db-001.sql.")
-            return
+            if not execute_ssh_command(ssh, "cd /opt/pasarguard && cat pg_dump/globals.sql | docker compose exec -T timescaledb psql -U pasarguard", "Restoring globals.sql"):
+                print_error("Aborting: failed to restore globals.sql.")
+                return
+            if not execute_ssh_command(ssh, "cd /opt/pasarguard && cat pg_dump/db-001.sql | docker compose exec -T timescaledb psql -U pasarguard -d pasarguard", "Restoring db-001.sql (Please wait, this might take a while for large databases)"):
+                print_error("Aborting: failed to restore db-001.sql.")
+                return
+        else:
+            if not start_compose_stack_ssh(ssh, PASARGUARD_DIR, "Pasarguard DB", services=["mysql"], wait_mysql=True):
+                print_error("Aborting: mysql did not start correctly.")
+                return
 
-        # Start full Pasarguard stack, then PG-Node — verify both are running
+            mysql_pw = resolve_mysql_root_password_ssh(
+                ssh, PASARGUARD_DIR, extra_candidates=[pre_restore_mysql_password]
+            )
+            if not mysql_pw:
+                print_error("Aborting: could not authenticate to MySQL with any provided password.")
+                return
+
+            drop_create_cmd = "cd /opt/pasarguard && docker compose exec -T mysql sh -c " + shlex.quote(
+                f'mysql -uroot -p{mysql_pw} -e "DROP DATABASE IF EXISTS pasarguard; CREATE DATABASE pasarguard;"'
+            )
+            if not execute_ssh_command(ssh, drop_create_cmd, "Dropping old database and creating a fresh one"):
+                print_error("Aborting: failed to drop/create mysql database.")
+                return
+            restore_cmd = "cd /opt/pasarguard && cat pg_dump/db_backup.sql | docker compose exec -T mysql sh -c " + shlex.quote(
+                f'mysql -uroot -p{mysql_pw} pasarguard'
+            )
+            if not execute_ssh_command(ssh, restore_cmd, "Restoring db_backup.sql (Please wait)"):
+                print_error("Aborting: failed to restore db_backup.sql.")
+                return
+
+            if not sync_app_db_credentials_ssh(ssh, PASARGUARD_DIR, mysql_pw):
+                print_error("Aborting: failed to sync application DB user credentials with .env.")
+                return
+
         if not start_compose_stack_ssh(ssh, PASARGUARD_DIR, "Pasarguard"):
             print_error("Aborting: Pasarguard containers did not start correctly.")
             return
@@ -630,7 +923,7 @@ def workflow_auto_backup_restore():
         except:
             pass
 
-def workflow_backup_bot():
+def workflow_backup_bot(db_type="timescaledb"):
     print_header("Auto Backup to Telegram Bot (Scheduled)")
     
     bot_token = input(f"{Colors.CYAN}🔑 Enter Telegram Bot Token: {Colors.RESET}").strip()
@@ -658,7 +951,7 @@ def workflow_backup_bot():
             current_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"\n{Colors.BOLD}⏳ Starting scheduled task at {current_time_str}...{Colors.RESET}")
             
-            zip_file_path = create_backup()
+            zip_file_path = create_backup(db_type)
             
             if zip_file_path and os.path.exists(zip_file_path):
                 print_info("Uploading to Telegram...")
@@ -684,18 +977,18 @@ def workflow_backup_bot():
     except KeyboardInterrupt:
         print(f"\n{Colors.YELLOW}🚪 Backup scheduler stopped by user.{Colors.RESET}")
 
-def workflow_manual_backup():
+def workflow_manual_backup(db_type="timescaledb"):
     print_header("Manual Backup (Local)")
     print_info("This will create a backup and save it in the current directory.")
     
-    zip_file_path = create_backup()
+    zip_file_path = create_backup(db_type)
     
     if zip_file_path and os.path.exists(zip_file_path):
         print_success(f"Manual backup completed! Your file is safe at: {zip_file_path}")
     else:
         print_error("Manual backup failed!")
 
-def workflow_manual_restore():
+def workflow_manual_restore(db_type="timescaledb"):
     print_header("Manual Restore (Local)")
     print_info("This process will wipe the current Pasarguard & PG-Node setup and restore from a ZIP file.")
     
@@ -710,8 +1003,11 @@ def workflow_manual_restore():
         print_warning("Restore process aborted by user.")
         return
 
+    pre_restore_mysql_password = None
+    if db_type == "mysql":
+        pre_restore_mysql_password = capture_current_mysql_password_local(PASARGUARD_DIR)
+
     try:
-        # Step 1: Stop both Docker stacks (two separate folders), then clean
         if not stop_compose_stack_local(PG_NODE_DIR, "PG-Node"):
             print_error("Aborting: PG-Node containers could not be stopped cleanly.")
             return
@@ -723,7 +1019,6 @@ def workflow_manual_restore():
             print_error("Aborting: directory cleanup failed.")
             return
         
-        # Step 2: Extract files
         print_info("Extracting backup files (This may take a moment)...")
         if not run_command(f"unzip -q -o {zip_name} -d /opt/pasarguard"):
             print_error("Failed to extract backup archive.")
@@ -735,29 +1030,52 @@ def workflow_manual_restore():
         run_command("cp -a /opt/pasarguard/pg_node_data/. /var/lib/pg-node/ 2>/dev/null || true")
         run_command("rm -rf /opt/pasarguard/pg_node_opt /opt/pasarguard/pg_node_data /opt/pasarguard/pasarguard_data")
         
-        # Step 3: Start DB only and wait until PostgreSQL is fully ready
-        if not start_compose_stack_local(PASARGUARD_DIR, "Pasarguard DB", services=["timescaledb"], wait_postgres=True):
-            raise Exception("timescaledb did not start correctly")
-        
-        # Step 4: Drop and Recreate DB
-        print_info("Dropping old database to prevent conflicts...")
-        if not run_command('cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres -c "DROP DATABASE IF EXISTS pasarguard WITH (FORCE);"'):
-            raise Exception("Failed to drop old database")
-        
-        print_info("Creating a fresh, clean database...")
-        if not run_command('cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres -c "CREATE DATABASE pasarguard;"'):
-            raise Exception("Failed to create database")
+        if db_type == "timescaledb":
+            if not start_compose_stack_local(PASARGUARD_DIR, "Pasarguard DB", services=["timescaledb"], wait_postgres=True):
+                raise Exception("timescaledb did not start correctly")
+            
+            print_info("Dropping old database to prevent conflicts...")
+            if not run_command('cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres -c "DROP DATABASE IF EXISTS pasarguard WITH (FORCE);"'):
+                raise Exception("Failed to drop old database")
+            
+            print_info("Creating a fresh, clean database...")
+            if not run_command('cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres -c "CREATE DATABASE pasarguard;"'):
+                raise Exception("Failed to create database")
 
-        # Step 5: Restore DBs
-        print_info("Restoring PostgreSQL globals...")
-        if not run_command("cd /opt/pasarguard && cat pg_dump/globals.sql | docker compose exec -T timescaledb psql -U pasarguard"):
-            raise Exception("Failed to restore globals.sql")
+            print_info("Restoring PostgreSQL globals...")
+            if not run_command("cd /opt/pasarguard && cat pg_dump/globals.sql | docker compose exec -T timescaledb psql -U pasarguard"):
+                raise Exception("Failed to restore globals.sql")
+                
+            print_info("Restoring Pasarguard database... (Please wait, this might take a while for large databases)")
+            if not run_command("cd /opt/pasarguard && cat pg_dump/db-001.sql | docker compose exec -T timescaledb psql -U pasarguard -d pasarguard"):
+                raise Exception("Failed to restore db-001.sql")
+        else:
+            if not start_compose_stack_local(PASARGUARD_DIR, "Pasarguard DB", services=["mysql"], wait_mysql=True):
+                raise Exception("mysql did not start correctly")
+
+            mysql_pw = resolve_mysql_root_password_local(
+                PASARGUARD_DIR, extra_candidates=[pre_restore_mysql_password]
+            )
+            if not mysql_pw:
+                raise Exception("Could not authenticate to MySQL with any provided password")
+
+            print_info("Dropping old database and creating a fresh one...")
+            drop_create_cmd = "cd /opt/pasarguard && docker compose exec -T mysql sh -c " + shlex.quote(
+                f'mysql -uroot -p{mysql_pw} -e "DROP DATABASE IF EXISTS pasarguard; CREATE DATABASE pasarguard;"'
+            )
+            if not run_command(drop_create_cmd):
+                raise Exception("Failed to drop/create mysql database")
+
+            print_info("Restoring MySQL database... (Please wait)")
+            restore_cmd = "cd /opt/pasarguard && cat pg_dump/db_backup.sql | docker compose exec -T mysql sh -c " + shlex.quote(
+                f'mysql -uroot -p{mysql_pw} pasarguard'
+            )
+            if not run_command(restore_cmd):
+                raise Exception("Failed to restore db_backup.sql")
+
+            if not sync_app_db_credentials_local(PASARGUARD_DIR, mysql_pw):
+                raise Exception("Failed to sync application DB user credentials with .env")
             
-        print_info("Restoring Pasarguard database... (Please wait, this might take a while for large databases)")
-        if not run_command("cd /opt/pasarguard && cat pg_dump/db-001.sql | docker compose exec -T timescaledb psql -U pasarguard -d pasarguard"):
-            raise Exception("Failed to restore db-001.sql")
-            
-        # Step 6: Start full stacks and verify both are running
         if not start_compose_stack_local(PASARGUARD_DIR, "Pasarguard"):
             raise Exception("Pasarguard containers did not start correctly")
         if not start_compose_stack_local(PG_NODE_DIR, "PG-Node"):
@@ -772,7 +1090,6 @@ def workflow_manual_restore():
 
 def main():
     while True:
-        # Clear screen
         os.system('cls' if os.name == 'nt' else 'clear')
         
         print(f"\n{Colors.HEADER}{Colors.BOLD}=================================================={Colors.RESET}")
@@ -790,17 +1107,24 @@ def main():
         
         choice = input(f"{Colors.CYAN}👉 Please select an option (1-5): {Colors.RESET}").strip()
         
+        db_type = "timescaledb"
+        if choice in ['1', '2', '3', '4']:
+            print("")
+            db_choice = input(f"{Colors.CYAN}🗄️  Which database are you using? (1: timescaledb, 2: mysql): {Colors.RESET}").strip()
+            if db_choice == '2':
+                db_type = "mysql"
+        
         if choice == '1':
-            workflow_auto_backup_restore()
+            workflow_auto_backup_restore(db_type)
             pause_and_return()
         elif choice == '2':
-            workflow_backup_bot()
+            workflow_backup_bot(db_type)
             pause_and_return()
         elif choice == '3':
-            workflow_manual_backup()
+            workflow_manual_backup(db_type)
             pause_and_return()
         elif choice == '4':
-            workflow_manual_restore()
+            workflow_manual_restore(db_type)
             pause_and_return()
         elif choice == '5':
             print(f"{Colors.YELLOW}🚪 Exiting... Have a great day!{Colors.RESET}")
