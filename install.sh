@@ -15,7 +15,7 @@ echo -e "${YELLOW}➔ Installing required system packages (paramiko, unzip, flas
 apt-get update >/dev/null 2>&1
 apt-get install -y python3-paramiko python3-flask python3-pip unzip >/dev/null 2>&1
 
-URL="https://raw.githubusercontent.com/Mo3tafa/PasarGuard-bk.re/main/bk_re.py"
+URL="https://raw.githubusercontent.com/Mo3tafakhodsetan/PasarGuard-bk.re/main/bk_re.py"
 FILE="bk_re.py"
 
 echo -e "${CYAN}➔ Downloading the script...${NC}"
