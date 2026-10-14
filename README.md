@@ -9,7 +9,7 @@
 برای نصب اسکریپت، کافیست با دسترسی روت (Root) وارد ترمینال سرور خود شده و دستور زیر را اجرا کنید:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/1NoJoom/PasarGuard-bk.re/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Mo3tafakhodsetan/PasarGuard-bk.re/main/install.sh)"
 ```
 ## 🔄 نحوه اجرای مجدد منو
 در صورتی که مراحل نصب به پایان رسید یا از منوی برنامه خارج شدید، نیازی به اجرای مجدد دستور نصب نیست. برای دسترسی دوباره به منوی مدیریت ابزار، کافیست کلمه زیر را در ترمینال تایپ و اینتر کنید:
